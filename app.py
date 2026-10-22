@@ -155,33 +155,46 @@ class FloorballTacticalEngine:
         closest_player = None
         min_dist = float('inf')
 
+        # Assign possession based on ball position
         if ball_pos is not None:
             bx, by = ball_pos
             for p in players:
                 px, py = p["pos"]
                 dist = math.hypot(px - bx, py - by)
-                if dist < min_dist and dist <= 1.2:
+                if dist < min_dist and dist <= 3.0:
                     min_dist = dist
                     closest_player = p["id"]
                     current_team = p["team"]
+
+        # Fallback possession estimation if ball is unobserved
+        elif len(players) > 0:
+            team_a_count = sum(1 for p in players if p["team"] == "Team A")
+            team_b_count = sum(1 for p in players if p["team"] == "Team B")
+            if team_a_count > team_b_count:
+                current_team = "Team A"
+            elif team_b_count > team_a_count:
+                current_team = "Team B"
 
         self.possession_counter[current_team] += 1
 
         if current_team in ["Team A", "Team B"]:
             if (self.last_possession_team == current_team and 
                 self.last_possession_player is not None and 
+                closest_player is not None and
                 self.last_possession_player != closest_player):
                 self.passes[current_team] += 1
             
+            if closest_player is not None:
+                self.last_possession_player = closest_player
             self.last_possession_team = current_team
-            self.last_possession_player = closest_player
 
+        # Shot detection logic
         if ball_pos is not None and current_team != "Neutral":
             bx, by = ball_pos
             target_goal = self.goal_b if current_team == "Team A" else self.goal_a
             dist_to_goal = math.hypot(bx - target_goal[0], by - target_goal[1])
 
-            if dist_to_goal <= 12.0 and min_dist <= 0.8:
+            if dist_to_goal <= 12.0 and min_dist <= 2.0:
                 if not self.shots or (frame_idx - self.shots[-1]["frame"]) > 30:
                     xg_val = self.calculate_xg(bx, by, target_goal)
                     self.shots.append({
@@ -212,7 +225,8 @@ class FloorballTacticalEngine:
             "completed_passes": self.passes,
             "total_shots": shot_counts,
             "expected_goals_xg": team_xg,
-            "shot_details": self.shots
+            "shot_details": self.shots,
+            "processed_frames": total_frames
         }
 
 
@@ -224,11 +238,14 @@ def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", fra
     video_path = download_or_load_video(video_source)
     cap = cv2.VideoCapture(video_path)
 
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+
     initial_pixel_corners = np.array([
-        [150, 200],   # Top-Left corner
-        [1130, 200],  # Top-Right corner
-        [1250, 680],  # Bottom-Right corner
-        [30, 680]     # Bottom-Left corner
+        [0, 0],                         # Top-Left corner
+        [frame_width, 0],               # Top-Right corner
+        [frame_width, frame_height],    # Bottom-Right corner
+        [0, frame_height]               # Bottom-Left corner
     ], dtype=np.float32)
 
     transformer = DynamicRinkTransformer(initial_pixel_corners)
@@ -260,13 +277,14 @@ def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", fra
 
                     x_m, y_m = transformer.to_meters(cx_px, cy_px)
 
-                    if 0.0 <= x_m <= 40.0 and 0.0 <= y_m <= 20.0:
-                        if cls_id == 0:  # Player class
-                            team = "Team A" if tid % 2 == 0 else "Team B"
-                            players.append({"id": tid, "team": team, "pos": (x_m, y_m)})
+                    # COCO class 0 = person (player)
+                    if cls_id == 0:
+                        team = "Team A" if tid % 2 == 0 else "Team B"
+                        players.append({"id": tid, "team": team, "pos": (x_m, y_m)})
 
-                        elif cls_id == 3:  # Ball class
-                            ball_pos = (x_m, y_m)
+                    # COCO class 32 = sports ball
+                    elif cls_id == 32:
+                        ball_pos = (x_m, y_m)
 
         engine.process_frame(frame_idx, players, ball_pos)
         frame_idx += 1
@@ -309,6 +327,7 @@ def main():
                     stats = run_match_analysis(video_input)
                     st.session_state["stats"] = stats
                     st.success("Analysis complete!")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error processing video: {e}")
 
@@ -316,6 +335,7 @@ def main():
     if "stats" in st.session_state:
         stats = st.session_state["stats"]
 
+        st.subheader("📊 Tactical Summary")
         col1, col2, col3, col4 = st.columns(4)
         poss = stats["possession_percentage"]
         col1.metric("Possession", f"Team A {poss.get('Team A', 0)}% - {poss.get('Team B', 0)}% Team B")
@@ -343,11 +363,16 @@ def main():
         ax.add_patch(plt.Rectangle((0, 8.25), 2.5, 3.5, color='orange', alpha=0.5))
         ax.add_patch(plt.Rectangle((37.5, 8.25), 2.5, 3.5, color='orange', alpha=0.5))
 
-        for shot in stats["shot_details"]:
-            color = 'blue' if shot["team"] == "Team A" else 'red'
-            size = shot["xg"] * 300 + 50
-            ax.scatter(shot["x"], shot["y"], s=size, c=color, alpha=0.7, edgecolors='black')
-            ax.annotate(f"xG {shot['xg']}", (shot["x"] + 0.5, shot["y"] + 0.5), fontsize=8)
+        shot_details = stats.get("shot_details", [])
+        if len(shot_details) > 0:
+            for shot in shot_details:
+                color = 'blue' if shot["team"] == "Team A" else 'red'
+                size = shot["xg"] * 300 + 50
+                ax.scatter(shot["x"], shot["y"], s=size, c=color, alpha=0.7, edgecolors='black')
+                ax.annotate(f"xG {shot['xg']}", (shot["x"] + 0.5, shot["y"] + 0.5), fontsize=8)
+        else:
+            ax.text(20, 10, "No shots detected in processed sample frames", 
+                    ha='center', va='center', fontsize=12, color='gray', style='italic')
 
         ax.set_title("Floorball Court Shot Map (Blue = Team A, Red = Team B)")
         ax.set_xlabel("Length (Meters)")
