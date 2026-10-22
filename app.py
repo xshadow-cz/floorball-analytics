@@ -89,7 +89,6 @@ class DynamicRinkTransformer:
             self.prev_gray = gray
             return
 
-        # Handle scene cuts safely
         if self.is_scene_cut(gray):
             self.prev_gray = gray
             return
@@ -139,8 +138,9 @@ class FloorballTacticalEngine:
         self.passes = {"Team A": 0, "Team B": 0}
         self.shots = []
         
-        self.last_possession_player = None
+        self.last_active_player = None
         self.last_possession_team = None
+        self.consecutive_frames_in_zone = 0
 
     def calculate_xg(self, shot_x: float, shot_y: float, target_goal: tuple) -> float:
         gx, gy = target_goal
@@ -148,14 +148,14 @@ class FloorballTacticalEngine:
         angle = math.atan2(abs(shot_y - gy), max(dist, 0.1))
         
         raw_xg = 1.0 / (1.0 + math.exp(0.35 * dist + 1.2 * angle - 0.5))
-        return round(min(max(raw_xg, 0.01), 0.95), 2)
+        return round(min(max(raw_xg, 0.05), 0.85), 2)
 
     def process_frame(self, frame_idx: int, players: list, ball_pos: tuple):
         current_team = "Neutral"
         closest_player = None
         min_dist = float('inf')
 
-        # Assign possession based on ball position
+        # 1. Primary: Assign possession via ball position if detected
         if ball_pos is not None:
             bx, by = ball_pos
             for p in players:
@@ -166,44 +166,60 @@ class FloorballTacticalEngine:
                     closest_player = p["id"]
                     current_team = p["team"]
 
-        # Fallback possession estimation if ball is unobserved
-        elif len(players) > 0:
-            team_a_count = sum(1 for p in players if p["team"] == "Team A")
-            team_b_count = sum(1 for p in players if p["team"] == "Team B")
-            if team_a_count > team_b_count:
+        # 2. Fallback: Assign possession via offensive zone player cluster
+        if current_team == "Neutral" and len(players) > 0:
+            team_a_players = [p for p in players if p["team"] == "Team A"]
+            team_b_players = [p for p in players if p["team"] == "Team B"]
+            
+            if len(team_a_players) > len(team_b_players):
                 current_team = "Team A"
-            elif team_b_count > team_a_count:
+                # Select the player furthest in the offensive half as the lead carrier
+                lead_player = max(team_a_players, key=lambda p: p["pos"][0])
+                closest_player = lead_player["id"]
+            elif len(team_b_players) > len(team_a_players):
                 current_team = "Team B"
+                lead_player = min(team_b_players, key=lambda p: p["pos"][0])
+                closest_player = lead_player["id"]
 
         self.possession_counter[current_team] += 1
 
+        # 3. Pass Detection Engine
         if current_team in ["Team A", "Team B"]:
             if (self.last_possession_team == current_team and 
-                self.last_possession_player is not None and 
-                closest_player is not None and
-                self.last_possession_player != closest_player):
+                self.last_active_player is not None and 
+                closest_player is not None and 
+                self.last_active_player != closest_player):
                 self.passes[current_team] += 1
-            
+
             if closest_player is not None:
-                self.last_possession_player = closest_player
+                self.last_active_player = closest_player
             self.last_possession_team = current_team
 
-        # Shot detection logic
-        if ball_pos is not None and current_team != "Neutral":
-            bx, by = ball_pos
+        # 4. Shot and xG Detection Engine
+        active_player_obj = next((p for p in players if p["id"] == closest_player), None) if closest_player else None
+        
+        if active_player_obj:
+            px, py = active_player_obj["pos"]
             target_goal = self.goal_b if current_team == "Team A" else self.goal_a
-            dist_to_goal = math.hypot(bx - target_goal[0], by - target_goal[1])
+            dist_to_goal = math.hypot(px - target_goal[0], py - target_goal[1])
 
-            if dist_to_goal <= 12.0 and min_dist <= 2.0:
-                if not self.shots or (frame_idx - self.shots[-1]["frame"]) > 30:
-                    xg_val = self.calculate_xg(bx, by, target_goal)
-                    self.shots.append({
-                        "team": current_team,
-                        "x": bx,
-                        "y": by,
-                        "xg": xg_val,
-                        "frame": frame_idx
-                    })
+            # Player in high-danger slot area (within 12 meters of target goal)
+            if dist_to_goal <= 12.0:
+                self.consecutive_frames_in_zone += 1
+                
+                # Register shot after attacking presence in slot (or ball shot trigger)
+                if self.consecutive_frames_in_zone == 10 or ball_pos is not None:
+                    if not self.shots or (frame_idx - self.shots[-1]["frame"]) > 25:
+                        xg_val = self.calculate_xg(px, py, target_goal)
+                        self.shots.append({
+                            "team": current_team,
+                            "x": round(px, 2),
+                            "y": round(py, 2),
+                            "xg": xg_val,
+                            "frame": frame_idx
+                        })
+            else:
+                self.consecutive_frames_in_zone = 0
 
     def get_summary_report(self) -> dict:
         total_frames = sum(self.possession_counter.values())
@@ -234,7 +250,7 @@ class FloorballTacticalEngine:
 # 4. MAIN COMPUTER VISION PIPELINE
 # ==========================================
 
-def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", frame_limit: int = 150) -> dict:
+def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", frame_limit: int = 300) -> dict:
     video_path = download_or_load_video(video_source)
     cap = cv2.VideoCapture(video_path)
 
@@ -302,6 +318,9 @@ def main():
     st.title("🏑 Automated Floorball Tactical Dashboard")
     st.write("Upload a match video or enter a YouTube URL to extract tactical statistics.")
 
+    st.sidebar.header("⚙️ Processing Settings")
+    frame_limit = st.sidebar.slider("Frames to Analyze:", min_value=150, max_value=1500, value=300, step=50)
+
     # Drag & Drop File Uploader
     uploaded_file = st.file_uploader("Upload a video file from your computer (.mp4):", type=["mp4", "mov", "avi"])
     
@@ -322,9 +341,9 @@ def main():
         if not video_input:
             st.warning("Please upload a video file or enter a YouTube URL first!")
         else:
-            with st.spinner("Analyzing match frames and tracking camera motion..."):
+            with st.spinner(f"Analyzing {frame_limit} match frames and tracking tactical stats..."):
                 try:
-                    stats = run_match_analysis(video_input)
+                    stats = run_match_analysis(video_input, frame_limit=frame_limit)
                     st.session_state["stats"] = stats
                     st.success("Analysis complete!")
                     st.rerun()
