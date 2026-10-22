@@ -14,16 +14,22 @@ import matplotlib.pyplot as plt
 
 def download_or_load_video(video_source: str, save_filename: str = "input_match.mp4") -> str:
     """
-    Downloads video from YouTube URL or verifies local file path.
+    Downloads video from YouTube URL or verifies local file path with cloud bypass headers.
     """
     if os.path.exists(video_source):
         return video_source
 
     if video_source.startswith("http://") or video_source.startswith("https://"):
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'best[ext=mp4]/best',
             'outtmpl': save_filename,
-            'quiet': True
+            'quiet': True,
+            'nocheckcertificate': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios']
+                }
+            }
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_source])
@@ -50,6 +56,7 @@ class DynamicRinkTransformer:
             [0.0, h]      # Bottom-Left
         ], dtype=np.float32)
 
+        self.initial_corners = initial_pixel_corners.astype(np.float32)
         self.current_pixel_corners = initial_pixel_corners.astype(np.float32)
         self.H, _ = cv2.findHomography(self.current_pixel_corners, self.target_corners)
         
@@ -60,6 +67,17 @@ class DynamicRinkTransformer:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
 
+    def is_scene_cut(self, current_gray: np.ndarray, threshold: float = 40.0) -> bool:
+        """
+        Detects hard video cuts, title screens, or transitions using mean absolute pixel difference.
+        """
+        if self.prev_gray is None:
+            return False
+        
+        diff = cv2.absdiff(self.prev_gray, current_gray)
+        mean_diff = np.mean(diff)
+        return mean_diff > threshold
+
     def update_camera_motion(self, current_frame: np.ndarray):
         """
         Tracks static background feature points between consecutive frames 
@@ -68,6 +86,11 @@ class DynamicRinkTransformer:
         gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
 
         if self.prev_gray is None:
+            self.prev_gray = gray
+            return
+
+        # Handle scene cuts safely
+        if self.is_scene_cut(gray):
             self.prev_gray = gray
             return
 
@@ -237,12 +260,13 @@ def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", fra
 
                     x_m, y_m = transformer.to_meters(cx_px, cy_px)
 
-                    if cls_id == 0:  # Player class
-                        team = "Team A" if tid % 2 == 0 else "Team B"
-                        players.append({"id": tid, "team": team, "pos": (x_m, y_m)})
+                    if 0.0 <= x_m <= 40.0 and 0.0 <= y_m <= 20.0:
+                        if cls_id == 0:  # Player class
+                            team = "Team A" if tid % 2 == 0 else "Team B"
+                            players.append({"id": tid, "team": team, "pos": (x_m, y_m)})
 
-                    elif cls_id == 3:  # Ball class
-                        ball_pos = (x_m, y_m)
+                        elif cls_id == 3:  # Ball class
+                            ball_pos = (x_m, y_m)
 
         engine.process_frame(frame_idx, players, ball_pos)
         frame_idx += 1
@@ -258,18 +282,35 @@ def run_match_analysis(video_source: str, model_weights: str = "yolov8n.pt", fra
 def main():
     st.set_page_config(page_title="Floorball Match Analytics", layout="wide")
     st.title("🏑 Automated Floorball Tactical Dashboard")
-    st.write("Upload a match video or run processing to extract tactical statistics.")
+    st.write("Upload a match video or enter a YouTube URL to extract tactical statistics.")
 
-    video_input = st.text_input("Enter Match Video Path or YouTube URL:", "input_match.mp4")
+    # Drag & Drop File Uploader
+    uploaded_file = st.file_uploader("Upload a video file from your computer (.mp4):", type=["mp4", "mov", "avi"])
+    
+    # YouTube URL or Local File Path Text Input
+    url_input = st.text_input("OR Enter YouTube URL / File Path:", "")
+
+    video_input = None
+
+    if uploaded_file is not None:
+        temp_filename = "temp_uploaded_video.mp4"
+        with open(temp_filename, "wb") as f:
+            f.write(uploaded_file.read())
+        video_input = temp_filename
+    elif url_input.strip() != "":
+        video_input = url_input.strip()
 
     if st.button("🚀 Process Match Video"):
-        with st.spinner("Analyzing match frames and tracking camera motion..."):
-            try:
-                stats = run_match_analysis(video_input)
-                st.session_state["stats"] = stats
-                st.success("Analysis complete!")
-            except Exception as e:
-                st.error(f"Error processing video: {e}")
+        if not video_input:
+            st.warning("Please upload a video file or enter a YouTube URL first!")
+        else:
+            with st.spinner("Analyzing match frames and tracking camera motion..."):
+                try:
+                    stats = run_match_analysis(video_input)
+                    st.session_state["stats"] = stats
+                    st.success("Analysis complete!")
+                except Exception as e:
+                    st.error(f"Error processing video: {e}")
 
     # Display results if available
     if "stats" in st.session_state:
